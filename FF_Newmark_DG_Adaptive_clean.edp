@@ -1,0 +1,255 @@
+//Time integration of a wave equation with the newmark scheme:
+//Reference: Time Domain Electromagnetics - (reference from Hafner;s book - available at Science Direct)
+// "Gregoire Allaire - Numerical Analysis and Optimization - pg 
+//
+// The discontinuous formulation was inspired from :
+// "DISCONTINUOUS GALERKIN FINITE ELEMENT METHOD FOR THE WAVE EQUATION GROTE"
+//
+////////
+//Parameters:
+// -disc       controls the discretization (it makes a difference only when not using adaptation)
+// -hmax       the maximum triangle side length acceptable by the adaptation step
+// -hmin       >>  minimum >>  >>
+// -ADAPT      Adapt the mesh according to a measure
+// -tsteps     in how many timesteps to split the time interval. The timesteping is implicit 
+//             so only order of time integration accuracy considerations should be taken into 
+//             account when chosing
+// -checksol   save the error of the solution to a file (the name is predefined)
+// -saveSol    this option is in order to calculate an accurate solution with high discretization and
+//             low timesteping in order to check the error of a less accurate solution with checksol
+// -comment    adds a comment in the last column of the solution file. Usefull to group runs etc.
+// -T          when an incident wave is used as loading, the period of the wave.
+// -IWloading  incident wave loading
+// -maxverts   maximum vertices allowed in the mesh adaptation procedure
+//There are some redundancies in the code relating to a previous implementation that included more loading conditions. 
+//For the seminar work I focused on initial value problems.
+//example:
+// FreeFem++ FF_Newmark_DG_Adaptive_clean.edp -adapt 1 -hmin 0.05 -hmax 0.6
+// FreeFem++ FF_Newmark_DG_Adaptive_clean.edp -disc 50 -adapt 1 -hmin 0.05 -hmax 0.6 -tfinal 5 -tsteps 200
+include "getARGV.idp"
+
+string comment = getARGV("-comment","nothing special");
+real T = getARGV("-T",1);
+int DISC = getARGV("-disc",20);
+real hMax = getARGV("-hmax",0.5);
+real hMin = getARGV("-hmin",0.1);
+int adaptMesh = getARGV("-adapt",0);
+int timesteps = getARGV("-tsteps",50);
+real tFinal = getARGV("-tfinal",5);
+int checkRefSol = getARGV("-checkSol",0);
+int saveSol = getARGV("-saveSol",0);
+real activateIWloading = getARGV("-IWloading",0);
+int maxvertices= getARGV("-maxverts",3000);
+real tgv = 0;
+real[int] sourcepoint(2);
+sourcepoint=[0,0.5];
+
+macro borderline(a, b, lab) (t=0,1) { x = a[0]+t*(b[0]-a[0]); y = a[1]+t*(b[1]-a[1]); label = lab; } // EOM
+//macro incidentWave(t,T,cc,theta) (1-x<t*cc?1.:0.)*0*sin(-2.*pi/(T*cc)*x - 2*pi/T*t) //EOM
+macro initConds() 1*(exp(-50*((-1.0-x)^2+(0.5-y)^2))) //EOM
+//Sine wave excitation(To keep track of frequncy for easier formulation of ABCs):
+macro incidentWave(t,T,cc,theta) (t<T)*(-0.01+sourcepoint[0]<=x)*(x<=0.01+sourcepoint[0])*(-0.01+sourcepoint[1]<=y)*(y<=sourcepoint[1]+0.01)*(sin(2*pi/T*t)) //EOM
+macro penaltyRegion() (-0.05+sourcepoint[0]<=x)*(x<=0.05+sourcepoint[0])*(-0.05+sourcepoint[1]<=y)*(y<=sourcepoint[1]+0.05) //EOM
+macro knownEfield(tt) penaltyRegion*sin(2*pi/T*tt) //EOM
+
+
+//The DGFEM integration part:
+//an aditional integration takes place for the edge jumps
+macro sf1(cc,uu,vv) jump(uu)*mean(cc * dx(vv)+cc*dy(vv)) //EOM
+macro KvarfDiscont(cc,multWith,uTrial,uTest,IP) -intalledges(Th)(multWith*sf1(cc,uTrial,uTest) ) - intalledges(Th)(multWith*sf1(cc,uTest,uTrial) ) + intalledges(Th)(multWith*IP*cc*jump(uTrial)*jump(uTest) )  //EOM 
+
+//Other loading options
+macro vwave() 0*sin(2*pi*x)*cos(2*pi*y) //EOM
+macro uwave() 0*sin(3*pi*x)*cos(4*pi*y) //EOM
+
+
+//The variational formulations of the matrices as they appear in the ODE that is to be timestepped with Newmark.
+macro Mvarf(multWith,uTrial,uTest) int2d(Th)(multWith*uTrial*uTest) //EOM
+macro Kvarf(multWith,uTrial,uTest) (int2d(Th)(multWith*dx(uTrial)*dx(uTest) +multWith*dy(uTrial)*dy(uTest))  )//EOM
+macro KvarfBC(t,m,uTest) = int2d(Th)(m*uTest*t) //EOM
+
+real t=0.;
+real cExt =1;
+
+
+//Newmark's parameters;
+real alpha = 0.25;
+real delta = 0.5;
+real theta = 1;
+real eExt = 3; 
+
+
+real dt = tFinal/timesteps;
+border Bext (t=0,2*pi) {x=0.0+1.5*cos(t);y=0.5+1.5*sin(t) ; label = 99;}
+
+//~ mesh Th =buildmesh(So1(dsp(disc[4])*/);
+
+mesh Th =buildmesh(Bext(DISC));
+mesh ThSwap = Th;
+
+//The most intuitive way I thought of to project the values from the old mesh to the new one is to use two
+fespace Ph(Th,P1);
+fespace Vh(Th,P2dc);
+fespace PhSwap(ThSwap,P1);
+fespace VhSwap(ThSwap,P2dc);
+Ph reg=region;
+Ph c;
+c=1;
+
+/*
+ * All these parameters make sense 
+ * in the context presented in "Time Domain Electrodynamics"
+ * but to really understand what the boundary conditions are 
+ * I had to check out the "Numerical Analysis and Optimization" Book (Allaire)
+ */
+
+//For the Mm matrix
+Ph mmL;mmL=(1./c^2);real mkL=alpha*dt^2;
+//For the Lm Matrix
+Ph mmM=(2./c^2);real mkM=dt^2*(-0.5-delta+2*alpha);
+//For the Nm matrix
+Ph mmN=-1./c^2;real mkN=(dt^2*(-0.5+delta-alpha));
+
+
+//The interior penalty depends on mesh size and "c" -  it is not arbitrary.
+//The value here is just for the first testing
+
+Vh IPval;
+
+PhSwap cSwap;
+Vh temp1x;
+VhSwap uTrialSwap,uOldSwap;
+Vh uTrial,uTest,uOld,uNew,utt;
+mesh Th0 = Th;
+
+for(real t=0;t<tFinal;t+=dt){	
+	if(t==0.){uTrial = initConds;uOld=uTrial;cout<<"FT STEP!"<<endl;}
+
+	//There might be some redundancies here.
+	//I project everything back and forth to make sure all is in order.
+	//the projection step is only needed in the case of an h-adaptive FE solution.
+	uOldSwap = uOld;
+	uTrialSwap = uTrial;	
+	cSwap=c;	
+	
+	Ph adaptMetrix,adaptMetr2,Thresh;
+	adaptMetrix = sqrt((dxx(uOld) + dyy(uOld)-utt/c)^2);
+	adaptMetr2= mean(dx(uOld)*N.x + dy(uOld)*N.y);
+	//plot(adaptMetr2,fill=true,wait=true,value=true);
+	//plot(Th,adaptMetrix,wait=false,fill=true,value=true);
+	adaptMetrix = sqrt(adaptMetrix);
+	Thresh = uTrial>0.1;
+	//adaptMetrix = adaptMetrix * uTrial;
+	//adaptMetrix = jump(uTrial);
+	//plot(adaptMetrix,wait=true,fill=true,value=true);
+	if(adaptMesh >0){
+		Th = adaptmesh(Th0,iso=true,adaptMetrix,nbvx=maxvertices,hmin=hMin,hmax = hMax);
+	}
+	IPval =20. * c/hTriangle; 
+	//plot(IPval,fill=true);
+	//Th = splitmesh(ThSwap,uTrial);	
+	//plot(Th);
+	//Vh uOld;
+	
+	//uAdaptationMeasure = uTrial;		
+
+	//Here I hope the interpolation is happening...
+	uTrial = uTrialSwap;
+	c = cSwap;
+	
+	uOld = uOldSwap;
+	//temp1x = temp1xOld;	
+	ThSwap=Th;
+
+	cout<<"Degrees of freedom of uold:"<<uOld.n<<endl;	
+	cout<<"Degrees of freedom of uTrial"<<uTrial.n<<endl;
+	cout<<"Degrees of freedom of the current FE space:"<<Vh.ndof<<endl;
+	varf Lmatr(uTrial, uTest) =Mvarf(mmL,uTest,uTrial) 
+									+Kvarf(mkL,uTest,uTrial)
+									+KvarfDiscont(c,mkL,uTest,uTrial,IPval)
+									-int2d(Th)(mkL*uTest*tgv*penaltyRegion)
+									;
+
+	varf Mmatr(uTrial,uTest) =  Mvarf(mmM,uTest,uTrial) 
+									+Kvarf(mkM,uTest,uTrial)									
+									+KvarfDiscont(c,mkM,uTest, uTrial, IPval)
+									-int2d(Th)(mkM*uTest*tgv*penaltyRegion)
+									;
+	varf Nmatr(uTrial,uTest) =  Mvarf(mmN,uTest,uTrial)
+									+Kvarf(mkN,uTest,uTrial)
+									+KvarfDiscont(c,mkN,uTest, uTrial, IPval)
+									-int2d(Th)(mkN*uTest*tgv*penaltyRegion)
+									;
+
+	//The load vector is only obvious in the context of Allair's book:
+	//I have to multiply the current load by (0.5+delta-2*theta) (obvious because it comes from the Cvarf formulation
+	//and also the previous load vector by (0.5 - delta + theta)
+	//and the next load vector by theta. Then I have to collect all the terms related to the 
+	//current displacement and add them to my load vector. 
+	varf Bvect(uTrial,uTest) = int2d(Th)(uTest*activateIWloading*( (0.5-delta+alpha) *dt^2  * (incidentWave(t-dt,T,c,theta) ) //Load in Previous step
+					 						+(0.5+delta-2*alpha)*dt^2 * ( incidentWave(t,T,c,theta) )   //Load in Current step
+											+(alpha)*dt^2             * ( incidentWave(t+dt,T,c,theta) ))) //Load in Previous Step
+				
+				   +int2d(Th)(uTest*activateIWloading*((0.5-delta+alpha) *dt^2  * knownEfield(t-dt)
+											+(0.5+delta-2*alpha) *dt^2* knownEfield(t)
+											+(alpha)*dt^2*knownEfield(t+dt))*tgv);
+	matrix Lm = Lmatr(Vh,Vh);
+	matrix Mm = Mmatr(Vh,Vh);
+	matrix Nm = Nmatr(Vh,Vh);
+	verbosity=2;
+
+	//set(Lm,solver=sparsesolver);
+	//set(Lm,solver = LU);
+	
+	Vh uLoadVector,uNew;
+	
+	uLoadVector[] = Bvect(0,Vh);
+	
+	cout<<"Degrees of freedom of uold:"<<uOld.n<<endl;	
+	cout<<"Degrees of freedom of uTrial"<<uTrial.n<<endl;
+	cout<<"Degrees of freedom of the current FE space:"<<Vh.ndof<<endl;
+	
+	Vh temp1xx;
+	
+	plot(Th,uTrial,dim=3,fill=true,cmm="uTrial of previous step");
+	//plot(uOld,cmm="uOld before timestepping");
+	temp1xx[] = Mm*uTrial[];
+	uLoadVector  = uLoadVector + temp1xx;
+	//plot(uLoadVector,cmm="uLoadVector",wait=true);
+	temp1xx[] = Nm*uOld[];
+	uLoadVector  = uLoadVector+temp1xx;
+	//uOld[]=uTrial[];
+	uNew[]=Lm^-1*uLoadVector[];
+	
+	utt = (uNew - 2*uTrial + uOld)/(dt^2);
+	uOld = uTrial;
+	uTrial = uNew;
+	verbosity=1;
+	//plot(Th);
+//plot(Th,uOld,wait=true,fill=true,value=true);
+	
+	cout<<"t="<<t<<endl;
+}
+
+if(checkRefSol==1){
+	mesh ThPrev= readmesh("DGPreviousSolutionMeshFile.msh");
+	fespace VhPrevious(ThPrev,P2dc);
+	VhPrevious uRef;
+
+
+	ifstream ff2("DGPreviousSolution.solution");
+	ff2 >> uRef[];
+
+	plot(uRef,ThPrev,fill=false,cmm="DGPrevious Solution and mesh",wait=false);
+	uRef  = uRef - uTrial;
+	plot(uRef,cmm="difference of solutions",fill=true,value=true,wait=false);
+
+	ofstream fErr("DGL2Errors.err",append);
+	fErr << adaptMesh<<" "<<hMin<<" "<<hMax<<" "<<dt<<" "<< sqrt(int2d(Th)((uRef^2+dx(uRef)^2+dxx(uRef)^2+dy(uRef)^2+dyy(uRef)^2+dxy(uRef)^2))) <<comment<<endl;
+}
+if(saveSol==1){
+	savemesh(Th,"DGPreviousSolutionMeshFile.msh");
+	ofstream ff("DGPreviousSolution.solution");
+	ff<< uTrial[];
+}
+end;
